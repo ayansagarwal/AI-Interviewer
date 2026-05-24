@@ -1,0 +1,83 @@
+@import "tailwindcss";
+
+:root {
+  --background: #0b0d12;
+  --foreground: #f5f7fb;
+  --surface: #131724;
+  --surface-2: #1b2130;
+  --accent: #f6c06a;
+  --accent-2: #6cd4ff;
+  --muted: #a7b3c6;
+  --border: rgba(255, 255, 255, 0.08);
+  --glow: rgba(108, 212, 255, 0.2);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-sans);
+  --font-display: var(--font-display);
+}
+
+body {
+  background: radial-gradient(circle at 20% 20%, #1a2240 0%, transparent 45%),
+    radial-gradient(circle at 80% 0%, #223254 0%, transparent 40%),
+    radial-gradient(circle at 80% 80%, #20344a 0%, transparent 45%),
+    var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans), "Segoe UI", sans-serif;
+  letter-spacing: -0.01em;
+}
+
+.font-display {
+  font-family: var(--font-display), "Times New Roman", serif;
+}
+
+.glass-panel {
+  background: linear-gradient(160deg, rgba(19, 23, 36, 0.9), rgba(27, 33, 48, 0.75));
+  border: 1px solid var(--border);
+  box-shadow: 0 20px 60px rgba(5, 7, 10, 0.45);
+}
+
+.wave {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.wave-bar {
+  width: 8px;
+  height: 20px;
+  border-radius: 999px;
+  background: linear-gradient(180deg, var(--accent-2), var(--accent));
+  animation: wave 1.25s ease-in-out infinite;
+  box-shadow: 0 0 18px var(--glow);
+}
+
+.wave-bar:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.wave-bar:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+.wave-bar:nth-child(4) {
+  animation-delay: 0.45s;
+}
+
+.wave-bar:nth-child(5) {
+  animation-delay: 0.6s;
+}
+
+@keyframes wave {
+  0%,
+  100% {
+    transform: scaleY(0.35);
+    opacity: 0.6;
+  }
+  50% {
+    transform: scaleY(1.2);
+    opacity: 1;
+  }
+}
