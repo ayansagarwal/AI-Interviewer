@@ -2,6 +2,8 @@ import Link from "next/link";
 import { Calendar, ChevronRight, Trophy } from "lucide-react";
 
 import { createClient } from "@/lib/supabase/server";
+import StartNewInterview from "@/app/dashboard/start-new-interview";
+import UserMenu from "@/app/dashboard/user-menu";
 
 export default async function DashboardPage() {
   const supabase = await createClient();
@@ -9,6 +11,9 @@ export default async function DashboardPage() {
     .from("sessions")
     .select("id, target_role, created_at, evaluations (overall_score)")
     .order("created_at", { ascending: false });
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
 
   const sessions = data ?? [];
 
@@ -27,8 +32,12 @@ export default async function DashboardPage() {
             each completed interview.
           </p>
         </div>
-        <div className="glass-panel rounded-full px-6 py-3 text-sm text-slate-200">
-          {sessions.length} sessions logged
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="glass-panel rounded-full px-6 py-3 text-sm text-slate-200">
+            {sessions.length} sessions logged
+          </div>
+          <StartNewInterview />
+          <UserMenu email={user?.email} displayName={user?.user_metadata?.name} />
         </div>
       </div>
 

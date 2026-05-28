@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useParams } from "next/navigation";
 import {
   AlertTriangle,
   Mic,
@@ -33,7 +34,9 @@ function formatTime(totalSeconds: number) {
   return `${minutes}:${seconds}`;
 }
 
-export default function InterviewPage({ params }: { params: { id: string } }) {
+export default function InterviewPage() {
+  const params = useParams<{ id: string }>();
+  const sessionId = params?.id ?? "";
   const [elapsed, setElapsed] = useState(0);
   const [muted, setMuted] = useState(false);
   const [simulateInterruption, setSimulateInterruption] = useState(false);
@@ -50,7 +53,7 @@ export default function InterviewPage({ params }: { params: { id: string } }) {
           <div className="flex flex-wrap items-center justify-between gap-4">
             <div>
               <p className="text-xs uppercase tracking-[0.3em] text-slate-400">
-                Session {params.id}
+                Session {sessionId || "-"}
               </p>
               <h1 className="font-display mt-3 text-3xl font-semibold text-white">
                 AI Interviewer Presence
