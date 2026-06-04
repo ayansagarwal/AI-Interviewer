@@ -8,15 +8,16 @@ type StarFeedback = Record<string, string>;
 export default async function ReportPage({
   params,
 }: {
-  params: { id: string };
+  params: Promise<{ id: string }>;
 }) {
+  const { id } = await params;
   const supabase = await createClient();
   const { data: evaluation } = await supabase
     .from("evaluations")
     .select(
       "overall_score, star_method_feedback, communication_score, strengths, weaknesses, created_at, session: sessions (target_role)"
     )
-    .eq("session_id", params.id)
+    .eq("session_id", id)
     .maybeSingle();
 
   const starRaw = evaluation?.star_method_feedback as StarFeedback | null;
