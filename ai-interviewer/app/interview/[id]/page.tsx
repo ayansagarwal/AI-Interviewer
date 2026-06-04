@@ -353,7 +353,7 @@ function InterviewWorkspace({ sessionId, targetRole }: InterviewWorkspaceProps) 
                   Live transcription
                 </div>
                 <div className="mt-4 space-y-4 max-h-[300px] overflow-y-auto pr-2 text-sm text-slate-200">
-                  {transcripts.map((line, index) => (
+                  {transcripts.map((line) => (
                     <div
                       key={line.id}
                       className={`rounded-2xl border p-4 ${
@@ -489,7 +489,7 @@ export default function InterviewPage() {
         const supabase = createClient();
         const { data: sessionData, error: dbError } = await supabase
           .from("sessions")
-          .select("target_role")
+          .select("target_role, status")
           .eq("id", sessionId)
           .single();
 
@@ -512,16 +512,23 @@ export default function InterviewPage() {
         if (!active) return;
         setToken(token);
 
-        // 3. Trigger Modal Voice Agent in parallel (asynchronously)
-        fetch("/api/interview/start-agent", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({ sessionId }),
-        }).catch((err) => {
-          console.error("Failed to trigger Modal agent:", err);
-        });
+        // 3. Only trigger the Modal agent if the session hasn't been started yet.
+        // Guard against duplicate spawns from page refresh or React StrictMode double-invoke.
+        if (sessionData?.status === "configured") {
+          // Mark the session as active first to prevent re-triggering on refresh.
+          await supabase
+            .from("sessions")
+            .update({ status: "active" })
+            .eq("id", sessionId);
+
+          fetch("/api/interview/start-agent", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ sessionId }),
+          }).catch((err) => {
+            console.error("Failed to trigger Modal agent:", err);
+          });
+        }
 
       } catch (err: any) {
         console.error("Initialization error:", err);

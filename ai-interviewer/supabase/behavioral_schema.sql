@@ -4,7 +4,7 @@ create type public.session_status as enum ('configured', 'active', 'completed');
 create type public.transcript_speaker as enum ('candidate', 'interviewer');
 
 create table public.users (
-  id uuid primary key default gen_random_uuid(),
+  id uuid primary key references auth.users(id) on delete cascade,
   name text,
   email text,
   created_at timestamptz not null default now()
@@ -157,3 +157,26 @@ create policy "Users can delete own evaluations" on public.evaluations
         and public.sessions.user_id = auth.uid()
     )
   );
+
+-- Automatically create a public.users profile row when a new auth user signs up.
+-- This ensures the FK constraint on sessions.user_id is always satisfiable.
+create or replace function public.handle_new_user()
+returns trigger
+language plpgsql
+security definer set search_path = public
+as $$
+begin
+  insert into public.users (id, name, email)
+  values (
+    new.id,
+    new.raw_user_meta_data ->> 'full_name',
+    new.email
+  )
+  on conflict (id) do nothing;
+  return new;
+end;
+$$;
+
+create or replace trigger on_auth_user_created
+  after insert on auth.users
+  for each row execute procedure public.handle_new_user();

@@ -28,10 +28,23 @@ export async function GET(request: NextRequest) {
     }
   );
 
-  const { error } = await supabase.auth.exchangeCodeForSession(code);
+  const { data, error } = await supabase.auth.exchangeCodeForSession(code);
 
   if (error) {
     return NextResponse.redirect(new URL("/login", request.url));
+  }
+
+  // Upsert the public.users profile row in case the DB trigger hasn't run yet
+  // (e.g. for users who signed up before the trigger was applied).
+  if (data.user) {
+    await supabase.from("users").upsert(
+      {
+        id: data.user.id,
+        name: data.user.user_metadata?.full_name ?? null,
+        email: data.user.email ?? null,
+      },
+      { onConflict: "id" }
+    );
   }
 
   return response;

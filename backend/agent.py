@@ -7,8 +7,9 @@ from typing import Optional
 from livekit import api, rtc
 from livekit.agents import stt, tts, llm
 from livekit.agents.pipeline import VoicePipelineAgent
+from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS, APIConnectOptions
 from livekit.rtc import AudioFrame
-from livekit.agents.utils import AudioBuffer
+from livekit.agents.utils import AudioBuffer, merge_frames
 from livekit.plugins import openai, silero
 
 logger = logging.getLogger("voice-agent")
@@ -18,15 +19,22 @@ logger = logging.getLogger("voice-agent")
 class FasterWhisperSTT(stt.STT):
     def __init__(self, model_size_or_path: str = "turbo"):
         super().__init__(
-            capabilities=stt.STTCapabilities(streaming=False)
+            capabilities=stt.STTCapabilities(streaming=False, interim_results=False)
         )
         from faster_whisper import WhisperModel
         # Initialize model on GPU (CUDA) in float16 precision
         self.model = WhisperModel(model_size_or_path, device="cuda", compute_type="float16")
 
-    async def _recognize_impl(self, buffer: AudioBuffer, *, language: Optional[str] = None) -> stt.SpeechEvent:
-        # Merge audio frames into a single buffer
-        audio_bytes = b"".join([frame.data.tobytes() for frame in buffer.frames])
+    async def _recognize_impl(
+        self,
+        buffer: AudioBuffer,
+        *,
+        language: str | None,
+        conn_options: APIConnectOptions,
+    ) -> stt.SpeechEvent:
+        # Merge audio frames into a single contiguous frame
+        merged = merge_frames(buffer)
+        audio_bytes = merged.data.tobytes()
         
         # Convert PCM 16-bit to float32
         audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
@@ -42,7 +50,7 @@ class FasterWhisperSTT(stt.STT):
         
         return stt.SpeechEvent(
             type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-            alternatives=[stt.SpeechAlternative(text=text, language=lang)]
+            alternatives=[stt.SpeechData(text=text, language=lang or "en")]
         )
 
 
@@ -50,52 +58,68 @@ class FasterWhisperSTT(stt.STT):
 class KokoroTTS(tts.TTS):
     def __init__(self, model_path: str, voices_path: str, voice: str = "af_bella"):
         super().__init__(
-            capabilities=tts.TTSCapabilities(streaming=False)
+            capabilities=tts.TTSCapabilities(streaming=False),
+            sample_rate=24000,
+            num_channels=1,
         )
         from kokoro_onnx import Kokoro
         # ONNX model runs with GPU acceleration
         self.kokoro = Kokoro(model_path, voices_path)
         self.voice = voice
 
-    def synthesize(self, text: str) -> tts.ChunkedStream:
-        return KokoroChunkedStream(self.kokoro, text, self.voice)
+    def synthesize(
+        self, text: str, *, conn_options: Optional[APIConnectOptions] = None
+    ) -> tts.ChunkedStream:
+        return KokoroChunkedStream(
+            tts=self,
+            kokoro=self.kokoro,
+            text=text,
+            voice=self.voice,
+            conn_options=conn_options or DEFAULT_API_CONNECT_OPTIONS,
+        )
 
 
 class KokoroChunkedStream(tts.ChunkedStream):
-    def __init__(self, kokoro, text: str, voice: str):
-        super().__init__()
+    def __init__(
+        self,
+        *,
+        tts: tts.TTS,
+        kokoro,
+        text: str,
+        voice: str,
+        conn_options: APIConnectOptions,
+    ):
+        super().__init__(tts=tts, input_text=text, conn_options=conn_options)
         self.kokoro = kokoro
-        self.text = text
         self.voice = voice
-        self._processed = False
+        self.text = text  # store as public attribute to avoid relying on private base class internals
 
-    async def _run(self):
-        if self._processed:
-            return
-        self._processed = True
-
+    async def _run(self) -> None:
         loop = asyncio.get_running_loop()
         def generate():
             return self.kokoro.create(self.text, voice=self.voice, speed=1.0)
-            
+
         samples, sample_rate = await loop.run_in_executor(None, generate)
-        
+
         # Convert float32 samples to 16-bit PCM
         pcm_data = (samples * 32767).astype(np.int16).tobytes()
-        
+
         # Kokoro sample rate is 24000Hz. LiveKit supports 24kHz.
         num_samples = len(pcm_data) // 2
         frame = AudioFrame(
             data=pcm_data,
             sample_rate=24000,
             num_channels=1,
-            samples_per_channel=num_samples
+            samples_per_channel=num_samples,
         )
-        
-        self._queue.put_nowait(tts.SynthesizedAudio(
-            text=self.text,
-            frame=frame
-        ))
+
+        self._event_ch.send_nowait(
+            tts.SynthesizedAudio(
+                request_id="kokoro-req",
+                frame=frame,
+                is_final=True,
+            )
+        )
 
 
 # --- LLM Client Builder (Qwen 2.5 OpenAI-compatible Interface) ---
@@ -142,7 +166,7 @@ async def broadcast_transcript(room: rtc.Room, speaker: str, text: str, segment_
         return
         
     if segment_id is None:
-        segment_id = f"{speaker}-{int(asyncio.get_event_loop().time() * 1000)}"
+        segment_id = f"{speaker}-{int(asyncio.get_running_loop().time() * 1000)}"
         
     try:
         payload = json.dumps({
@@ -210,9 +234,8 @@ async def start_agent_session(room_name: str, token: str, target_role: str, job_
     # Trigger automatic voice greeting
     greeting = f"Hello! Welcome to your behavioral interview for the {target_role} position. Can you tell me about a time you had to solve a complex problem under a tight deadline?"
     await pipeline.say(greeting, allow_interruptions=True)
-    
-    # Broadcast the initial greeting
-    await broadcast_transcript(room, "interviewer", greeting, is_final=True)
+    # Note: the agent_speech_committed event handler above will broadcast this greeting
+    # to the data channel, so no manual broadcast_transcript call is needed here.
 
     # Active monitoring loop: shut down if the room becomes empty (only agent left)
     try:

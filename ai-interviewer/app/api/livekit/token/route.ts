@@ -66,7 +66,7 @@ export async function GET(request: NextRequest) {
     const at = new AccessToken(apiKey, apiSecret, {
       identity,
       name,
-      ttl: "2h", // Allow up to 2 hours for the interview session
+      ttl: "20m", // Match Modal container timeout (10 min) with a reasonable buffer
     });
 
     at.addGrant({

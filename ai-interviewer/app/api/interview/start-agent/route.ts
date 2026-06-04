@@ -55,10 +55,12 @@ export async function POST(request: NextRequest) {
     const timeoutId = setTimeout(() => controller.abort(), 4000);
 
     try {
+      const webhookSecret = process.env.MODAL_WEBHOOK_SECRET;
       const response = await fetch(modalTriggerUrl, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
+          ...(webhookSecret ? { Authorization: `Bearer ${webhookSecret}` } : {}),
         },
         body: JSON.stringify({
           room_name: sessionId,

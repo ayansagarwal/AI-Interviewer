@@ -7,15 +7,16 @@ app = modal.App("voice-agent")
 
 # Dependencies to install inside the GPU container
 pip_dependencies = [
-    "livekit>=0.18.0,<1.0.0",
-    "livekit-agents>=0.8.0,<1.0.0",
-    "livekit-plugins-silero>=0.6.0,<1.0.0",
-    "livekit-plugins-openai>=0.6.0,<1.0.0",
+    "livekit==0.17.6",
+    "livekit-agents==0.11.3",
+    "livekit-plugins-silero==0.7.3",
+    "livekit-plugins-openai==0.10.2",
     "faster-whisper>=1.0.3",
     "kokoro-onnx>=0.3.0",
     "onnxruntime-gpu>=1.17.0",
     "numpy<2.0.0",
     "soundfile>=0.12.1",
+    "supabase>=2.4.0",
     "python-dotenv>=1.0.1",
     "fastapi[standard]",
 ]
@@ -105,7 +106,16 @@ async def run_agent(room_name: str, target_role: str, job_description: str | Non
 # --- Public Serverless Webhook Endpoint (Option B Trigger) ---
 @app.function(image=container_image)
 @modal.fastapi_endpoint(method="POST")
-def start(data: dict):
+def start(data: dict, authorization: str = None):
+    # Validate the shared secret to prevent unauthorized agent spawning.
+    # Set MODAL_WEBHOOK_SECRET in both the Modal livekit-secrets secret and the Next.js env.
+    expected_secret = os.environ.get("MODAL_WEBHOOK_SECRET")
+    if expected_secret:
+        token = (authorization or "").removeprefix("Bearer ").strip()
+        if token != expected_secret:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
     room_name = data.get("room_name")
     target_role = data.get("target_role", "Product Manager")
     job_description = data.get("job_description")
