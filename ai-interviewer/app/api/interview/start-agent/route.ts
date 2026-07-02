@@ -24,11 +24,12 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    // Validate session ownership
+    // Validate session ownership with explicit user_id filter (defense-in-depth alongside RLS)
     const { data: session, error: sessionError } = await supabase
       .from("sessions")
       .select("id, target_role, job_description")
       .eq("id", sessionId)
+      .eq("user_id", user.id)
       .single();
 
     if (sessionError || !session) {
@@ -91,7 +92,7 @@ export async function POST(request: NextRequest) {
         {
           success: false,
           error: "Failed to communicate with Modal backend",
-          details: fetchError.message || String(fetchError),
+          details: process.env.NODE_ENV === "development" ? (fetchError.message || String(fetchError)) : "Agent trigger failed",
         },
         { status: 502 }
       );

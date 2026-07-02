@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { ArrowRight, Sparkles } from "lucide-react";
+import { ArrowRight, Mic, Sparkles } from "lucide-react";
 
 export default function Home() {
   return (
@@ -32,16 +32,21 @@ export default function Home() {
             algorithmic and system design interviews in the same workspace.
           </p>
           <div className="mt-10 flex flex-wrap gap-4">
+            {/* Primary CTA — starts an interview immediately */}
             <Link
-              href="/dashboard"
+              href="/dashboard?new=1"
               className="inline-flex items-center gap-2 rounded-full bg-[var(--accent)] px-6 py-3 text-sm font-semibold text-slate-900 transition hover:brightness-110"
             >
-              Open session history
+              <Mic className="h-4 w-4" />
+              Start interview
+            </Link>
+            <Link
+              href="/dashboard"
+              className="inline-flex items-center gap-2 rounded-full border border-white/10 px-6 py-3 text-sm font-medium text-slate-300 transition hover:border-white/30 hover:text-white"
+            >
+              View session history
               <ArrowRight className="h-4 w-4" />
             </Link>
-            <div className="rounded-full border border-white/10 px-6 py-3 text-sm text-slate-300">
-              Voice-first feedback. Behavioral interviews only for now.
-            </div>
           </div>
         </div>
 
@@ -59,16 +64,20 @@ export default function Home() {
           </div>
           <div className="glass-panel rounded-[24px] p-8">
             <h3 className="text-sm font-semibold uppercase tracking-[0.22em] text-slate-400">
-              Next session checklist
+              How it works
             </h3>
-            <div className="mt-4 space-y-4 text-sm text-slate-200">
-              <div className="flex items-center justify-between rounded-2xl border border-white/10 bg-white/5 px-4 py-3">
-                <span>Target role definition</span>
-                <span className="text-[var(--accent)]">Required</span>
+            <div className="mt-4 space-y-3 text-sm text-slate-200">
+              <div className="flex items-start gap-3">
+                <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-[var(--accent)]/20 text-xs font-semibold text-[var(--accent)]">1</span>
+                <span>Enter your target role and optionally paste a job description.</span>
               </div>
-              <div className="flex items-center justify-between rounded-2xl border border-white/10 bg-white/5 px-4 py-3">
-                <span>Job description context</span>
-                <span className="text-slate-400">Optional</span>
+              <div className="flex items-start gap-3">
+                <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-[var(--accent)]/20 text-xs font-semibold text-[var(--accent)]">2</span>
+                <span>Speak with your AI interviewer in a live 5-minute voice session.</span>
+              </div>
+              <div className="flex items-start gap-3">
+                <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-[var(--accent)]/20 text-xs font-semibold text-[var(--accent)]">3</span>
+                <span>Review your STAR alignment, strengths, and areas to improve.</span>
               </div>
             </div>
           </div>

@@ -10,27 +10,28 @@ pip_dependencies = [
     "livekit==0.17.6",
     "livekit-agents==0.11.3",
     "livekit-plugins-silero==0.7.3",
-    "livekit-plugins-openai==0.10.2",
+    "livekit-plugins-openai==0.10.7",
     "faster-whisper>=1.0.3",
-    "kokoro-onnx>=0.3.0",
+    "kokoro-onnx==0.3.3",
     "onnxruntime-gpu>=1.17.0",
-    "numpy<2.0.0",
+    "numpy>=1.24.0,<2.0.0",
     "soundfile>=0.12.1",
     "supabase>=2.4.0",
     "python-dotenv>=1.0.1",
     "fastapi[standard]",
+    "colorlog>=6.0.0",  # logging helper
+    "aiofiles>=23.0.0",  # async file I/O (also busts container pool for new llm-secrets)
 ]
 
 
 # Image build function to download and cache Whisper and Kokoro weights.
 # This prevents downloading weights during cold starts, bringing spin-up latency to a minimum.
 def download_models():
-    print("Pre-downloading faster-whisper 'turbo' weights...")
+    print("Pre-downloading faster-whisper 'small' weights...")
     from faster_whisper import WhisperModel
-    # Run transcription once on CPU dummy array to force download and caching
     import numpy as np
     dummy_audio = np.zeros(16000, dtype=np.float32)
-    model = WhisperModel("turbo", device="cpu")
+    model = WhisperModel("small", device="cpu", compute_type="int8")
     model.transcribe(dummy_audio)
 
     print("Pre-downloading Kokoro-82M model weights...")
@@ -67,7 +68,7 @@ container_image = (
 @app.function(
     image=container_image,
     gpu="t4",  # Use an NVIDIA T4 GPU (cost-efficient and low latency)
-    timeout=600,  # 10 minutes max session limit
+    timeout=1800,  # 30 minutes — enough for a full behavioral interview
     secrets=[
         modal.Secret.from_name("livekit-secrets"),
         modal.Secret.from_name("llm-secrets"),

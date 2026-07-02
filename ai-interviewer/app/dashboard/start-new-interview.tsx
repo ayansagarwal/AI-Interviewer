@@ -1,13 +1,22 @@
 "use client";
 
-import { useState, useTransition } from "react";
+import { Suspense, useEffect, useState, useTransition } from "react";
+import { useSearchParams } from "next/navigation";
 import { X } from "lucide-react";
 
 import { startNewInterview } from "./actions";
 
-export default function StartNewInterview() {
+function StartNewInterviewInner() {
+  const searchParams = useSearchParams();
   const [open, setOpen] = useState(false);
   const [isPending, startTransition] = useTransition();
+
+  // Auto-open the modal when linked from homepage with ?new=1
+  useEffect(() => {
+    if (searchParams.get("new") === "1") {
+      setOpen(true);
+    }
+  }, [searchParams]);
 
   const handleSubmit = (formData: FormData) => {
     startTransition(() => {
@@ -97,5 +106,13 @@ export default function StartNewInterview() {
         </div>
       ) : null}
     </>
+  );
+}
+
+export default function StartNewInterview() {
+  return (
+    <Suspense>
+      <StartNewInterviewInner />
+    </Suspense>
   );
 }

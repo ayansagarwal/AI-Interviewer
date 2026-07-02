@@ -66,7 +66,7 @@ export async function GET(request: NextRequest) {
     const at = new AccessToken(apiKey, apiSecret, {
       identity,
       name,
-      ttl: "20m", // Match Modal container timeout (10 min) with a reasonable buffer
+      ttl: "35m", // Slightly over container timeout to cover cold start
     });
 
     at.addGrant({

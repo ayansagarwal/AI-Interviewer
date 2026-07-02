@@ -20,16 +20,19 @@ import {
   useRoomContext,
   useConnectionState,
 } from "@livekit/components-react";
-import { ConnectionState, RoomEvent, Track } from "livekit-client";
+import { ConnectionState, ParticipantEvent, RoomEvent, Track } from "livekit-client";
 
 // Format seconds to mm:ss
 function formatTime(totalSeconds: number) {
-  const minutes = Math.floor(totalSeconds / 60)
+  const clamped = Math.max(0, totalSeconds);
+  const minutes = Math.floor(clamped / 60)
     .toString()
     .padStart(2, "0");
-  const seconds = (totalSeconds % 60).toString().padStart(2, "0");
+  const seconds = (clamped % 60).toString().padStart(2, "0");
   return `${minutes}:${seconds}`;
 }
+
+const INTERVIEW_DURATION = 5 * 60; // 5 minutes in seconds
 
 // Real-Time Audio Visualizer component using Web Audio API on the LiveKit microphone track
 function LiveAudioVisualizer({ stream }: { stream: MediaStream | null }) {
@@ -118,6 +121,8 @@ interface TranscriptLine {
 function InterviewWorkspace({ sessionId, targetRole }: InterviewWorkspaceProps) {
   const router = useRouter();
   const [elapsed, setElapsed] = useState(0);
+  const [timeWarning, setTimeWarning] = useState(false);   // 1-min warning
+  const [timeExpired, setTimeExpired] = useState(false);   // 5-min hard stop
   const [simulateInterruption, setSimulateInterruption] = useState(false);
   const [transcripts, setTranscripts] = useState<TranscriptLine[]>([
     {
@@ -148,16 +153,16 @@ function InterviewWorkspace({ sessionId, targetRole }: InterviewWorkspaceProps) 
 
     updateStream();
 
-    localParticipant.on(RoomEvent.TrackPublished, updateStream);
-    localParticipant.on(RoomEvent.TrackUnpublished, updateStream);
-    localParticipant.on(RoomEvent.TrackMuted, updateStream);
-    localParticipant.on(RoomEvent.TrackUnmuted, updateStream);
+    localParticipant.on(ParticipantEvent.LocalTrackPublished, updateStream);
+    localParticipant.on(ParticipantEvent.LocalTrackUnpublished, updateStream);
+    localParticipant.on(ParticipantEvent.TrackMuted, updateStream);
+    localParticipant.on(ParticipantEvent.TrackUnmuted, updateStream);
 
     return () => {
-      localParticipant.off(RoomEvent.TrackPublished, updateStream);
-      localParticipant.off(RoomEvent.TrackUnpublished, updateStream);
-      localParticipant.off(RoomEvent.TrackMuted, updateStream);
-      localParticipant.off(RoomEvent.TrackUnmuted, updateStream);
+      localParticipant.off(ParticipantEvent.LocalTrackPublished, updateStream);
+      localParticipant.off(ParticipantEvent.LocalTrackUnpublished, updateStream);
+      localParticipant.off(ParticipantEvent.TrackMuted, updateStream);
+      localParticipant.off(ParticipantEvent.TrackUnmuted, updateStream);
     };
   }, [localParticipant, isMicrophoneEnabled]);
 
@@ -184,42 +189,30 @@ function InterviewWorkspace({ sessionId, targetRole }: InterviewWorkspaceProps) 
             const id = data.id || `${data.speaker}-${Date.now()}`;
             const baseList = prev.filter((t) => t.id !== "welcome");
             const existingIndex = baseList.findIndex((t) => t.id === id);
-
             if (existingIndex !== -1) {
               const updated = [...baseList];
-              updated[existingIndex] = {
-                id,
-                speaker: data.speaker,
-                text: data.text,
-              };
+              updated[existingIndex] = { id, speaker: data.speaker, text: data.text };
               return updated;
-            } else {
-              return [
-                ...baseList,
-                {
-                  id,
-                  speaker: data.speaker,
-                  text: data.text,
-                },
-              ];
             }
+            return [...baseList, { id, speaker: data.speaker, text: data.text }];
           });
-
-          // Forward finalized transcript turns to our secure server proxy API
           if (data.isFinal) {
             fetch("/api/interview/transcript", {
               method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-              },
-              body: JSON.stringify({
-                sessionId: sessionId,
-                speaker: data.speaker,
-                text: data.text,
-              }),
-            }).catch((err) => {
-              console.error("Failed to proxy transcript log to Next.js API:", err);
-            });
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ sessionId, speaker: data.speaker, text: data.text }),
+            }).catch((err) => console.error("Failed to proxy transcript:", err));
+          }
+        }
+
+        if (data.type === "timer_event") {
+          if (data.event === "warning") {
+            setTimeWarning(true);
+          }
+          if (data.event === "expired") {
+            setTimeExpired(true);
+            // Give the agent ~8s to deliver its closing line, then auto-end
+            setTimeout(() => endInterview(), 8000);
           }
         }
       } catch (e) {
@@ -388,16 +381,38 @@ function InterviewWorkspace({ sessionId, targetRole }: InterviewWorkspaceProps) 
               </h2>
             </div>
 
-            <div className="rounded-3xl border border-white/10 bg-white/5 p-5">
-              <div className="flex items-center justify-between text-sm text-slate-200">
-                <span className="flex items-center gap-2">
-                  <Timer className="h-4 w-4 text-[var(--accent-2)]" />
-                  Live timer
+            <div className={`rounded-3xl border p-5 transition-colors duration-500 ${
+              timeExpired
+                ? "border-red-500/40 bg-red-500/10"
+                : timeWarning
+                ? "border-amber-500/40 bg-amber-500/10"
+                : "border-white/10 bg-white/5"
+            }`}>
+              <div className="flex items-center justify-between text-sm">
+                <span className={`flex items-center gap-2 font-medium ${
+                  timeExpired ? "text-red-400" : timeWarning ? "text-amber-400" : "text-slate-200"
+                }`}>
+                  <Timer className={`h-4 w-4 ${
+                    timeExpired ? "text-red-400" : timeWarning ? "text-amber-400" : "text-[var(--accent-2)]"
+                  }`} />
+                  {timeExpired ? "Time's up" : timeWarning ? "Time running out" : "Time remaining"}
                 </span>
-                <span className="text-base font-semibold text-white">
-                  {formatTime(elapsed)}
+                <span className={`text-base font-semibold tabular-nums ${
+                  timeExpired ? "text-red-400" : timeWarning ? "text-amber-300" : "text-white"
+                }`}>
+                  {timeExpired ? "00:00" : formatTime(INTERVIEW_DURATION - elapsed)}
                 </span>
               </div>
+              {connectionState === ConnectionState.Connected && (
+                <div className="mt-3 w-full h-1 rounded-full bg-white/10 overflow-hidden">
+                  <div
+                    className={`h-full rounded-full transition-all duration-1000 ${
+                      timeExpired ? "bg-red-500" : timeWarning ? "bg-amber-400" : "bg-[var(--accent)]"
+                    }`}
+                    style={{ width: `${Math.max(0, ((INTERVIEW_DURATION - elapsed) / INTERVIEW_DURATION) * 100)}%` }}
+                  />
+                </div>
+              )}
             </div>
 
             <button
@@ -513,21 +528,23 @@ export default function InterviewPage() {
         setToken(token);
 
         // 3. Only trigger the Modal agent if the session hasn't been started yet.
-        // Guard against duplicate spawns from page refresh or React StrictMode double-invoke.
+        // Guard against duplicate spawns — update status atomically, only if still 'configured'.
         if (sessionData?.status === "configured") {
-          // Mark the session as active first to prevent re-triggering on refresh.
-          await supabase
+          const { error: updateError } = await supabase
             .from("sessions")
             .update({ status: "active" })
-            .eq("id", sessionId);
+            .eq("id", sessionId)
+            .eq("status", "configured"); // atomic guard — only one concurrent caller wins
 
-          fetch("/api/interview/start-agent", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ sessionId }),
-          }).catch((err) => {
-            console.error("Failed to trigger Modal agent:", err);
-          });
+          if (!updateError) {
+            fetch("/api/interview/start-agent", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ sessionId }),
+            }).catch((err) => {
+              console.error("Failed to trigger Modal agent:", err);
+            });
+          }
         }
 
       } catch (err: any) {
@@ -600,7 +617,7 @@ export default function InterviewPage() {
       video={false}
       audio={true}
       token={token ?? undefined}
-      serverUrl={process.env.NEXT_PUBLIC_LIVEKIT_URL}
+      serverUrl={process.env.NEXT_PUBLIC_LIVEKIT_URL ?? ""}
       connect={true}
       className="min-h-screen"
     >

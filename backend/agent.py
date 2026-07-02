@@ -7,7 +7,6 @@ from typing import Optional
 from livekit import api, rtc
 from livekit.agents import stt, tts, llm
 from livekit.agents.pipeline import VoicePipelineAgent
-from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS, APIConnectOptions
 from livekit.rtc import AudioFrame
 from livekit.agents.utils import AudioBuffer, merge_frames
 from livekit.plugins import openai, silero
@@ -22,15 +21,16 @@ class FasterWhisperSTT(stt.STT):
             capabilities=stt.STTCapabilities(streaming=False, interim_results=False)
         )
         from faster_whisper import WhisperModel
-        # Initialize model on GPU (CUDA) in float16 precision
-        self.model = WhisperModel(model_size_or_path, device="cuda", compute_type="float16")
+        # Run STT on CPU with int8 — avoids CUDA library dependency issues.
+        # The VAD (Silero/ONNX) and TTS (Kokoro/ONNX) still use the GPU.
+        # Whisper 'turbo' on CPU is fast enough for non-streaming batch transcription.
+        self.model = WhisperModel(model_size_or_path, device="cpu", compute_type="int8")
 
     async def _recognize_impl(
         self,
         buffer: AudioBuffer,
         *,
-        language: str | None,
-        conn_options: APIConnectOptions,
+        language: str | None = None,
     ) -> stt.SpeechEvent:
         # Merge audio frames into a single contiguous frame
         merged = merge_frames(buffer)
@@ -56,55 +56,45 @@ class FasterWhisperSTT(stt.STT):
 
 # --- Custom Kokoro-82M TTS Wrapper (Runs locally on GPU) ---
 class KokoroTTS(tts.TTS):
-    def __init__(self, model_path: str, voices_path: str, voice: str = "af_bella"):
+    def __init__(self, model_path: str, voices_path: str, voice: str = "af_bella", speed: float = 1.0):
         super().__init__(
             capabilities=tts.TTSCapabilities(streaming=False),
             sample_rate=24000,
             num_channels=1,
         )
         from kokoro_onnx import Kokoro
-        # ONNX model runs with GPU acceleration
         self.kokoro = Kokoro(model_path, voices_path)
         self.voice = voice
+        self.speed = speed
 
-    def synthesize(
-        self, text: str, *, conn_options: Optional[APIConnectOptions] = None
-    ) -> tts.ChunkedStream:
+    def synthesize(self, text: str) -> tts.ChunkedStream:
         return KokoroChunkedStream(
-            tts=self,
             kokoro=self.kokoro,
             text=text,
             voice=self.voice,
-            conn_options=conn_options or DEFAULT_API_CONNECT_OPTIONS,
+            speed=self.speed,
+            tts_instance=self,
         )
 
 
 class KokoroChunkedStream(tts.ChunkedStream):
-    def __init__(
-        self,
-        *,
-        tts: tts.TTS,
-        kokoro,
-        text: str,
-        voice: str,
-        conn_options: APIConnectOptions,
-    ):
-        super().__init__(tts=tts, input_text=text, conn_options=conn_options)
+    def __init__(self, kokoro, text: str, voice: str, speed: float, tts_instance: tts.TTS):
+        super().__init__(tts_instance, text)
         self.kokoro = kokoro
         self.voice = voice
-        self.text = text  # store as public attribute to avoid relying on private base class internals
+        self.speed = speed
 
-    async def _run(self) -> None:
+    async def _main_task(self) -> None:
         loop = asyncio.get_running_loop()
         def generate():
-            return self.kokoro.create(self.text, voice=self.voice, speed=1.0)
+            return self.kokoro.create(self._input_text, voice=self.voice, speed=self.speed)
 
         samples, sample_rate = await loop.run_in_executor(None, generate)
 
         # Convert float32 samples to 16-bit PCM
         pcm_data = (samples * 32767).astype(np.int16).tobytes()
 
-        # Kokoro sample rate is 24000Hz. LiveKit supports 24kHz.
+        # Kokoro outputs at 24000Hz — LiveKit supports 24kHz natively
         num_samples = len(pcm_data) // 2
         frame = AudioFrame(
             data=pcm_data,
@@ -136,27 +126,37 @@ def create_llm():
     )
 
 
+INTERVIEW_DURATION_SECONDS = 5 * 60  # 5-minute interview limit
+
+
 # --- Helper to generate the behavioral interviewing system prompt ---
 def get_system_prompt(target_role: str, job_description: Optional[str] = None) -> str:
-    prompt = f"""You are a professional behavioral interviewer conducting a real-time behavioral voice interview for the role of: {target_role}.
+    prompt = f"""You are a professional behavioral interviewer conducting a real-time voice interview for the role of: {target_role}.
+
+This is a timed 5-minute interview. You must ask exactly 2 behavioral questions total and then close the interview gracefully.
+
+Interview structure:
+1. Brief warm welcome (1-2 sentences), then ask Question 1.
+2. After the candidate answers Question 1, probe any missing STAR elements (Situation, Task, Action, Result) with at most one follow-up. Then transition to Question 2.
+3. After the candidate answers Question 2, probe once if needed. Then deliver a warm 2-sentence closing that thanks the candidate and lets them know the interview is complete.
+
 """
     if job_description:
-        prompt += f"Job Description context:\n{job_description}\n"
-        
-    prompt += """
-Guidelines for your behavior:
-1. Focus on assessing behavioral qualities (leadership, communication, problem-solving, conflict resolution) using the STAR framework:
-   - Situation: Context of the scenario.
-   - Task: The candidate's target/goal.
-   - Action: What the candidate did.
-   - Result: Outcome and key learnings.
-2. Ask clear, open-ended questions. Only ask one question at a time.
-3. Be supportive and conversational, but maintain a professional demeanor.
-4. Listen carefully to the candidate's responses. Follow up on incomplete STAR aspects (e.g., if they tell a story but forget the Result, ask "What was the final outcome of that action?").
-5. Do NOT speak in long paragraphs. Keep your follow-ups and questions short (1-2 sentences) to suit a real-time voice chat.
-6. Do NOT write code, provide technical exercises, or write markdown formatting tags.
-7. Speak naturally. Do not reveal that you are an AI.
-"""
+        prompt += f"Job description context (use this to choose relevant behavioral questions):\n{job_description}\n\n"
+
+    prompt += f"""Behavioral question guidelines:
+- Choose questions that assess leadership, communication, problem-solving, or conflict resolution.
+- Each question must follow the STAR framework. If the candidate omits a STAR element, ask one short follow-up to surface it.
+- Only ask one question or follow-up at a time.
+- Keep all your responses short (1-3 sentences) — this is a voice interview, not a written one.
+- Do NOT use markdown, bullet points, or numbered lists in your speech.
+- Do NOT reveal that you are an AI.
+- Be supportive but professional.
+
+Time awareness:
+- You have 5 minutes total. Pace yourself so both questions get covered.
+- If you receive a time warning, wrap up your current thread quickly and move to closing.
+- Never go over the time limit — close the interview even if mid-answer."""
     return prompt
 
 
@@ -191,13 +191,17 @@ async def start_agent_session(room_name: str, token: str, target_role: str, job_
     logger.info(f"Connected to room: {room_name}")
 
     # Instantiate local GPU and API models
-    stt_model = FasterWhisperSTT("turbo")
+    stt_model = FasterWhisperSTT("small")   # 'small' is 4x faster than 'turbo' on CPU with acceptable accuracy
     tts_model = KokoroTTS(
         model_path="/root/models/kokoro-v0_19.onnx",
-        voices_path="/root/models/voices.json"
+        voices_path="/root/models/voices.json",
+        speed=1.3,   # Faster speech synthesis — reduces TTS generation time
     )
     llm_model = create_llm()
-    vad_model = silero.VAD.load()
+    vad_model = silero.VAD.load(
+        min_silence_duration=0.3,   # Was 0.55s default — cuts endpointing delay by ~250ms
+        min_speech_duration=0.1,    # Detect speech faster
+    )
 
     # Create LLM chat context
     chat_ctx = llm.ChatContext()
@@ -212,43 +216,103 @@ async def start_agent_session(room_name: str, token: str, target_role: str, job_
         stt=stt_model,
         llm=llm_model,
         tts=tts_model,
-        chat_ctx=chat_ctx
+        chat_ctx=chat_ctx,
+        min_endpointing_delay=0.3,   # How long after speech ends before LLM is triggered (default 0.5s)
     )
+
+    # Wire up speech committed events — register BEFORE pipeline.start()
+    @pipeline.on("user_speech_committed")
+    def on_user_speech(msg: llm.ChatMessage):
+        content = msg.content if isinstance(msg.content, str) else (
+            " ".join(p.text for p in msg.content if hasattr(p, "text"))
+            if msg.content else ""
+        )
+        if content:
+            logger.info(f"Candidate said: {content}")
+            asyncio.ensure_future(broadcast_transcript(room, "candidate", content, is_final=True))
+
+    @pipeline.on("agent_speech_committed")
+    def on_agent_speech(msg: llm.ChatMessage):
+        content = msg.content if isinstance(msg.content, str) else (
+            " ".join(p.text for p in msg.content if hasattr(p, "text"))
+            if msg.content else ""
+        )
+        if content:
+            logger.info(f"AI Interviewer said: {content}")
+            asyncio.ensure_future(broadcast_transcript(room, "interviewer", content, is_final=True))
 
     pipeline.start(room)
     logger.info("LiveKit VoicePipeline is running")
 
-    # Wire up speech committed events
-    @pipeline.on("user_speech_committed")
-    def on_user_speech(msg: llm.ChatMessage):
-        if msg.content:
-            logger.info(f"Candidate said: {msg.content}")
-            asyncio.create_task(broadcast_transcript(room, "candidate", msg.content, is_final=True))
+    # Yield to let the pipeline's internal _main_task start and publish the audio track.
+    await asyncio.sleep(0)
 
-    @pipeline.on("agent_speech_committed")
-    def on_agent_speech(msg: llm.ChatMessage):
-        if msg.content:
-            logger.info(f"AI Interviewer said: {msg.content}")
-            asyncio.create_task(broadcast_transcript(room, "interviewer", msg.content, is_final=True))
-
-    # Trigger automatic voice greeting
-    greeting = f"Hello! Welcome to your behavioral interview for the {target_role} position. Can you tell me about a time you had to solve a complex problem under a tight deadline?"
+    # Trigger opening greeting — the LLM will ask Q1 as part of its welcome.
+    greeting = f"Hello! Welcome to your {target_role} behavioral interview. We have 5 minutes together. I'll ask you two questions and would love to hear specific examples. Let's get started — can you tell me about a time you had to solve a challenging problem under pressure?"
     await pipeline.say(greeting, allow_interruptions=True)
-    # Note: the agent_speech_committed event handler above will broadcast this greeting
-    # to the data channel, so no manual broadcast_transcript call is needed here.
 
-    # Active monitoring loop: shut down if the room becomes empty (only agent left)
+    session_start = asyncio.get_running_loop().time()
+    warning_sent  = False
+    interview_ended = False
+
+    async def send_timer_event(event_type: str):
+        """Broadcast a timer control event over the data channel to the frontend."""
+        try:
+            payload = json.dumps({"type": "timer_event", "event": event_type}).encode("utf-8")
+            await room.local_participant.publish_data(payload)
+        except Exception as e:
+            logger.error(f"Failed to send timer event: {e}")
+
+    async def inject_time_warning():
+        """Inject a system message into the chat context so the LLM knows time is almost up."""
+        chat_ctx.append(
+            role="system",
+            text="[TIME WARNING] You have approximately 1 minute remaining. Wrap up your current thread and begin your closing remarks within the next exchange.",
+        )
+
     try:
         while True:
             await asyncio.sleep(5)
+
+            elapsed = asyncio.get_running_loop().time() - session_start
+            remaining = INTERVIEW_DURATION_SECONDS - elapsed
+
+            # Check if candidate is still present
             non_agent_participants = [
-                p for p in room.participants.values() if not p.identity.startswith("agent-")
+                p for p in room.remote_participants.values()
+                if not p.identity.startswith("agent-")
             ]
             if len(non_agent_participants) == 0:
-                logger.info("Room is empty. Disconnecting and shutting down agent container.")
+                logger.info("Room is empty. Shutting down.")
                 break
+
+            # 1-minute warning at 4:00 elapsed
+            if not warning_sent and elapsed >= (INTERVIEW_DURATION_SECONDS - 60):
+                logger.info("Sending 1-minute time warning to agent and frontend.")
+                warning_sent = True
+                await send_timer_event("warning")
+                await inject_time_warning()
+
+            # Hard cutoff at 5:00 elapsed
+            if not interview_ended and remaining <= 0:
+                logger.info("Time limit reached. Closing interview.")
+                interview_ended = True
+                await send_timer_event("expired")
+                # Inject a hard stop instruction so the LLM delivers a closing line
+                chat_ctx.append(
+                    role="system",
+                    text="[TIME UP] The 5-minute interview is now over. Deliver a warm, natural 1-2 sentence closing right now. Do not ask any more questions.",
+                )
+                break
+
     except asyncio.CancelledError:
         logger.info("Session cancelled.")
     finally:
+        if hasattr(pipeline, "_main_atask") and pipeline._main_atask:
+            pipeline._main_atask.cancel()
+            try:
+                await pipeline._main_atask
+            except (asyncio.CancelledError, Exception):
+                pass
         await room.disconnect()
         logger.info("Successfully cleaned up WebRTC connection.")

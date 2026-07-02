@@ -180,3 +180,8 @@ $$;
 create or replace trigger on_auth_user_created
   after insert on auth.users
   for each row execute procedure public.handle_new_user();
+
+-- Indexes for FK columns queried frequently
+create index if not exists idx_sessions_user_id on public.sessions (user_id);
+create index if not exists idx_transcripts_session_id on public.transcripts (session_id);
+create index if not exists idx_evaluations_session_id on public.evaluations (session_id);
