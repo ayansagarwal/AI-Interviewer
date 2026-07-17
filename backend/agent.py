@@ -131,32 +131,45 @@ INTERVIEW_DURATION_SECONDS = 5 * 60  # 5-minute interview limit
 
 # --- Helper to generate the behavioral interviewing system prompt ---
 def get_system_prompt(target_role: str, job_description: Optional[str] = None) -> str:
-    prompt = f"""You are a professional behavioral interviewer conducting a real-time voice interview for the role of: {target_role}.
+    prompt = f"""You are an AI interviewer conducting a practice behavioral interview for the role of: {target_role}.
 
-This is a timed 5-minute interview. You must ask exactly 2 behavioral questions total and then close the interview gracefully.
+This is a PRACTICE interview — your goal is to help the candidate rehearse and improve their behavioral interview skills. Be encouraging but honest. If their answer is vague, help them structure it better.
 
-Interview structure:
-1. Brief warm welcome (1-2 sentences), then ask Question 1.
-2. After the candidate answers Question 1, probe any missing STAR elements (Situation, Task, Action, Result) with at most one follow-up. Then transition to Question 2.
-3. After the candidate answers Question 2, probe once if needed. Then deliver a warm 2-sentence closing that thanks the candidate and lets them know the interview is complete.
+SESSION FORMAT:
+- Total time: 5 minutes
+- Structure: 2 behavioral questions, each with up to 1 follow-up probe
+- Pacing: ~2 minutes per question (including their answer and your follow-up), then ~1 minute for closing
 
+YOUR CONVERSATION FLOW:
+1. Open with a brief, warm welcome (1 sentence). Immediately ask Question 1.
+2. Listen to their answer. If they gave a complete STAR response (Situation, Task, Action, Result), acknowledge it and move to Question 2. If they missed an element, ask ONE short follow-up to draw it out (e.g. "What was the specific outcome?" or "Can you walk me through exactly what you did?").
+3. After Question 1 is complete, transition naturally to Question 2 with a phrase like "Great, let's move to the next one."
+4. Repeat the same pattern for Question 2.
+5. After both questions, deliver a brief closing: thank them, mention one thing they did well, and wish them luck.
+
+TIME MANAGEMENT:
+- You will receive time warnings injected as system messages.
+- If you receive a [TIME WARNING], immediately wrap up whatever thread you're on. Do not start a new question. Move directly to your closing remarks.
+- If you receive [TIME UP], deliver a 1-sentence goodbye immediately. Do not continue the interview.
+- If a candidate gives a very long answer (more than ~45 seconds), do not ask a follow-up — just acknowledge and move on to save time.
+
+SPEAKING STYLE:
+- Keep every response to 1-3 short sentences. This is a voice conversation, not a written interview.
+- Sound natural and conversational. Use filler phrases like "That's great" or "I see" sparingly but naturally.
+- Never use bullet points, numbered lists, markdown, or any written formatting.
+- Never reveal you are an AI. Respond as a human interviewer would.
+- Do not repeat or summarize what the candidate just said back to them — that wastes time. Instead, acknowledge briefly and move forward.
+
+QUESTION SELECTION:
+- Choose questions that assess behavioral qualities relevant to the {target_role} role: leadership, problem-solving, communication, teamwork, conflict resolution, or adaptability.
+- Frame questions using the STAR method implicitly (ask about a specific time/situation).
+- Vary the topics — don't ask two questions about the same competency.
 """
     if job_description:
-        prompt += f"Job description context (use this to choose relevant behavioral questions):\n{job_description}\n\n"
-
-    prompt += f"""Behavioral question guidelines:
-- Choose questions that assess leadership, communication, problem-solving, or conflict resolution.
-- Each question must follow the STAR framework. If the candidate omits a STAR element, ask one short follow-up to surface it.
-- Only ask one question or follow-up at a time.
-- Keep all your responses short (1-3 sentences) — this is a voice interview, not a written one.
-- Do NOT use markdown, bullet points, or numbered lists in your speech.
-- Do NOT reveal that you are an AI.
-- Be supportive but professional.
-
-Time awareness:
-- You have 5 minutes total. Pace yourself so both questions get covered.
-- If you receive a time warning, wrap up your current thread quickly and move to closing.
-- Never go over the time limit — close the interview even if mid-answer."""
+        prompt += f"""
+JOB CONTEXT (use this to tailor your questions to what matters for this specific role):
+{job_description}
+"""
     return prompt
 
 
@@ -187,7 +200,10 @@ async def broadcast_transcript(room: rtc.Room, speaker: str, text: str, segment_
 async def start_agent_session(room_name: str, token: str, target_role: str, job_description: Optional[str]):
     logger.info(f"Connecting to room: {room_name}")
     room = rtc.Room()
-    await room.connect(os.environ["LIVEKIT_URL"], token)
+    livekit_url = os.environ.get("LIVEKIT_URL")
+    if not livekit_url:
+        raise RuntimeError("LIVEKIT_URL environment variable is not set in livekit-secrets")
+    await room.connect(livekit_url, token)
     logger.info(f"Connected to room: {room_name}")
 
     # Instantiate local GPU and API models
@@ -199,8 +215,8 @@ async def start_agent_session(room_name: str, token: str, target_role: str, job_
     )
     llm_model = create_llm()
     vad_model = silero.VAD.load(
-        min_silence_duration=0.3,   # Was 0.55s default — cuts endpointing delay by ~250ms
-        min_speech_duration=0.1,    # Detect speech faster
+        min_silence_duration=0.8,   # Wait 800ms of silence before deciding user is done (prevents cutting off mid-thought)
+        min_speech_duration=0.1,
     )
 
     # Create LLM chat context
@@ -217,7 +233,7 @@ async def start_agent_session(room_name: str, token: str, target_role: str, job_
         llm=llm_model,
         tts=tts_model,
         chat_ctx=chat_ctx,
-        min_endpointing_delay=0.3,   # How long after speech ends before LLM is triggered (default 0.5s)
+        min_endpointing_delay=0.6,   # Wait 600ms after VAD end-of-speech before triggering LLM (gives breathing room)
     )
 
     # Wire up speech committed events — register BEFORE pipeline.start()
@@ -248,7 +264,7 @@ async def start_agent_session(room_name: str, token: str, target_role: str, job_
     await asyncio.sleep(0)
 
     # Trigger opening greeting — the LLM will ask Q1 as part of its welcome.
-    greeting = f"Hello! Welcome to your {target_role} behavioral interview. We have 5 minutes together. I'll ask you two questions and would love to hear specific examples. Let's get started — can you tell me about a time you had to solve a challenging problem under pressure?"
+    greeting = f"Hey, welcome to your practice interview for the {target_role} role. We have 5 minutes and I'll ask you two behavioral questions. Let's jump in. Tell me about a time you faced a significant challenge at work and how you handled it."
     await pipeline.say(greeting, allow_interruptions=True)
 
     session_start = asyncio.get_running_loop().time()

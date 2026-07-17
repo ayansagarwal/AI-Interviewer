@@ -121,6 +121,7 @@ interface TranscriptLine {
 function InterviewWorkspace({ sessionId, targetRole }: InterviewWorkspaceProps) {
   const router = useRouter();
   const [elapsed, setElapsed] = useState(0);
+  const [interviewStarted, setInterviewStarted] = useState(false);  // true once agent speaks
   const [timeWarning, setTimeWarning] = useState(false);   // 1-min warning
   const [timeExpired, setTimeExpired] = useState(false);   // 5-min hard stop
   const [simulateInterruption, setSimulateInterruption] = useState(false);
@@ -128,7 +129,7 @@ function InterviewWorkspace({ sessionId, targetRole }: InterviewWorkspaceProps) 
     {
       id: "welcome",
       speaker: "interviewer",
-      text: "Establishing secure audio connection. Please say hello when you are ready.",
+      text: "Connecting to your AI interviewer... This may take a moment on first use.",
     },
   ]);
   const [ending, setEnding] = useState(false);
@@ -166,13 +167,13 @@ function InterviewWorkspace({ sessionId, targetRole }: InterviewWorkspaceProps) 
     };
   }, [localParticipant, isMicrophoneEnabled]);
 
-  // Live Timer: starts when connected
+  // Live Timer: starts when the interviewer first speaks (not on connection)
   useEffect(() => {
-    if (connectionState !== ConnectionState.Connected) return;
+    if (!interviewStarted) return;
 
     const timer = setInterval(() => setElapsed((prev) => prev + 1), 1000);
     return () => clearInterval(timer);
-  }, [connectionState]);
+  }, [interviewStarted]);
 
   // Listen to LiveKit Data Channel messages for streaming transcripts
   useEffect(() => {
@@ -196,6 +197,12 @@ function InterviewWorkspace({ sessionId, targetRole }: InterviewWorkspaceProps) 
             }
             return [...baseList, { id, speaker: data.speaker, text: data.text }];
           });
+
+          // Start the interview timer on first interviewer message
+          if (data.speaker === "interviewer" && data.isFinal) {
+            setInterviewStarted(true);
+          }
+
           if (data.isFinal) {
             fetch("/api/interview/transcript", {
               method: "POST",
@@ -395,15 +402,23 @@ function InterviewWorkspace({ sessionId, targetRole }: InterviewWorkspaceProps) 
                   <Timer className={`h-4 w-4 ${
                     timeExpired ? "text-red-400" : timeWarning ? "text-amber-400" : "text-[var(--accent-2)]"
                   }`} />
-                  {timeExpired ? "Time's up" : timeWarning ? "Time running out" : "Time remaining"}
+                  {!interviewStarted
+                    ? "Waiting for interviewer..."
+                    : timeExpired
+                    ? "Time's up"
+                    : timeWarning
+                    ? "Time running out"
+                    : "Time remaining"}
                 </span>
                 <span className={`text-base font-semibold tabular-nums ${
-                  timeExpired ? "text-red-400" : timeWarning ? "text-amber-300" : "text-white"
+                  !interviewStarted ? "text-slate-400" : timeExpired ? "text-red-400" : timeWarning ? "text-amber-300" : "text-white"
                 }`}>
-                  {timeExpired ? "00:00" : formatTime(INTERVIEW_DURATION - elapsed)}
+                  {!interviewStarted ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : timeExpired ? "00:00" : formatTime(INTERVIEW_DURATION - elapsed)}
                 </span>
               </div>
-              {connectionState === ConnectionState.Connected && (
+              {interviewStarted && connectionState === ConnectionState.Connected && (
                 <div className="mt-3 w-full h-1 rounded-full bg-white/10 overflow-hidden">
                   <div
                     className={`h-full rounded-full transition-all duration-1000 ${

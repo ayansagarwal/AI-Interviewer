@@ -19,6 +19,14 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    // Limit text length to prevent abuse (10KB is more than enough for any single utterance)
+    if (typeof text !== "string" || text.length > 10000) {
+      return NextResponse.json(
+        { error: "Text too long or invalid" },
+        { status: 400 }
+      );
+    }
+
     // Initialize Supabase server-side client
     const supabase = await createClient();
 
