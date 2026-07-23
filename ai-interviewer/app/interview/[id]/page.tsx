@@ -134,6 +134,7 @@ function InterviewWorkspace({ sessionId, targetRole }: InterviewWorkspaceProps) 
   ]);
   const [ending, setEnding] = useState(false);
   const [micStream, setMicStream] = useState<MediaStream | null>(null);
+  const transcriptEndRef = useRef<HTMLDivElement>(null);
 
   const { localParticipant, isMicrophoneEnabled } = useLocalParticipant();
   const connectionState = useConnectionState();
@@ -175,6 +176,11 @@ function InterviewWorkspace({ sessionId, targetRole }: InterviewWorkspaceProps) 
     return () => clearInterval(timer);
   }, [interviewStarted]);
 
+  // Auto-scroll transcript to bottom when new messages arrive
+  useEffect(() => {
+    transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [transcripts]);
+
   // Listen to LiveKit Data Channel messages for streaming transcripts
   useEffect(() => {
     if (!room) return;
@@ -198,8 +204,8 @@ function InterviewWorkspace({ sessionId, targetRole }: InterviewWorkspaceProps) 
             return [...baseList, { id, speaker: data.speaker, text: data.text }];
           });
 
-          // Start the interview timer on first interviewer message
-          if (data.speaker === "interviewer" && data.isFinal) {
+          // Start the interview timer on first interviewer message (any, not just final)
+          if (data.speaker === "interviewer") {
             setInterviewStarted(true);
           }
 
@@ -347,12 +353,12 @@ function InterviewWorkspace({ sessionId, targetRole }: InterviewWorkspaceProps) 
             </div>
 
             <div className="rounded-3xl border border-white/10 bg-white/5 p-6 flex flex-col justify-between">
-              <div>
+              <div className="flex-1 min-h-0 flex flex-col">
                 <div className="flex items-center gap-2 text-sm font-semibold text-slate-200">
                   <MessageSquareText className="h-4 w-4 text-[var(--accent-2)]" />
                   Live transcription
                 </div>
-                <div className="mt-4 space-y-4 max-h-[300px] overflow-y-auto pr-2 text-sm text-slate-200">
+                <div className="mt-4 flex-1 space-y-3 max-h-[350px] overflow-y-auto pr-2 text-sm text-slate-200 scrollbar-thin">
                   {transcripts.map((line) => (
                     <div
                       key={line.id}
@@ -368,6 +374,7 @@ function InterviewWorkspace({ sessionId, targetRole }: InterviewWorkspaceProps) 
                       <p className="mt-2 text-sm text-slate-100">{line.text}</p>
                     </div>
                   ))}
+                  <div ref={transcriptEndRef} />
                 </div>
               </div>
               <p className="mt-4 text-xs text-slate-400">

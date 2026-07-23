@@ -5,58 +5,23 @@ import modal
 # Define the Modal App
 app = modal.App("voice-agent")
 
-# Dependencies to install inside the GPU container
+# Dependencies — no GPU-heavy packages needed anymore (STT + TTS are cloud APIs)
 pip_dependencies = [
     "livekit==0.17.6",
     "livekit-agents==0.11.3",
     "livekit-plugins-silero==0.7.3",
     "livekit-plugins-openai==0.10.7",
-    "faster-whisper>=1.0.3",
-    "kokoro-onnx==0.3.3",
-    "onnxruntime-gpu>=1.17.0",
+    "aiohttp>=3.9.0",
     "numpy>=1.24.0,<2.0.0",
-    "soundfile>=0.12.1",
-    "supabase>=2.4.0",
     "python-dotenv>=1.0.1",
     "fastapi[standard]",
-    "colorlog>=6.0.0",  # logging helper
-    "aiofiles>=23.0.0",  # async file I/O (also busts container pool for new llm-secrets)
 ]
 
-
-# Image build function to download and cache Whisper and Kokoro weights.
-# This prevents downloading weights during cold starts, bringing spin-up latency to a minimum.
-def download_models():
-    print("Pre-downloading faster-whisper 'small' weights...")
-    from faster_whisper import WhisperModel
-    import numpy as np
-    dummy_audio = np.zeros(16000, dtype=np.float32)
-    model = WhisperModel("small", device="cpu", compute_type="int8")
-    model.transcribe(dummy_audio)
-
-    print("Pre-downloading Kokoro-82M model weights...")
-    from huggingface_hub import hf_hub_download
-    os.makedirs("/root/models", exist_ok=True)
-    hf_hub_download(
-        repo_id="thewh1teagle/Kokoro",
-        filename="kokoro-v0_19.onnx",
-        local_dir="/root/models",
-    )
-    hf_hub_download(
-        repo_id="thewh1teagle/Kokoro",
-        filename="voices.json",
-        local_dir="/root/models",
-    )
-    print("Weights successfully cached inside container image!")
-
-
-# Set up the GPU container image definition.
-# We mount agent.py here using add_local_file so it is available to import in the container.
+# Lightweight container image — no model downloads needed (everything is cloud API)
 container_image = (
     modal.Image.debian_slim(python_version="3.10")
-    .apt_install("ffmpeg", "git", "curl")
+    .apt_install("ffmpeg")
     .pip_install(*pip_dependencies)
-    .run_function(download_models, timeout=1200)
     .add_local_file(
         local_path=os.path.join(os.path.dirname(__file__), "agent.py"),
         remote_path="/root/agent.py"
@@ -64,24 +29,24 @@ container_image = (
 )
 
 
-# --- GPU-Accelerated Voice Loop Agent Function ---
+# --- CPU-only Voice Agent Function (no GPU needed) ---
 @app.function(
     image=container_image,
-    gpu="t4",
+    cpu=2.0,
+    memory=2048,
     timeout=1800,  # 30 minutes max per interview
-    scaledown_window=300,  # Keep container warm for 5 min after finishing (eliminates cold start for back-to-back interviews)
+    scaledown_window=300,  # Keep container warm for 5 min after finishing
     secrets=[
         modal.Secret.from_name("livekit-secrets"),
         modal.Secret.from_name("llm-secrets"),
+        modal.Secret.from_name("deepgram-secretes"),
     ],
 )
 async def run_agent(room_name: str, target_role: str, job_description: str | None):
-    # Add container directory to path for local file imports
     sys.path.append("/root")
     from agent import start_agent_session
     from livekit import api
 
-    # Generate access token for the agent participant
     api_key = os.environ["LIVEKIT_API_KEY"]
     api_secret = os.environ["LIVEKIT_API_SECRET"]
 
@@ -100,24 +65,13 @@ async def run_agent(room_name: str, target_role: str, job_description: str | Non
     )
 
     token_jwt = token.to_jwt()
-
-    # Launch the agent WebRTC stream handler
     await start_agent_session(room_name, token_jwt, target_role, job_description)
 
 
-# --- Public Serverless Webhook Endpoint (Option B Trigger) ---
+# --- Public Serverless Webhook Endpoint ---
 @app.function(image=container_image)
 @modal.fastapi_endpoint(method="POST")
 def start(data: dict):
-    from fastapi import Request
-    import hmac
-    # Validate the shared secret to prevent unauthorized agent spawning.
-    expected_secret = os.environ.get("MODAL_WEBHOOK_SECRET")
-    if expected_secret:
-        # Note: In Modal's FastAPI endpoints, headers come via the data dict workaround.
-        # For now, skip auth if secret isn't configured — the endpoint URL itself is the secret.
-        pass
-
     room_name = data.get("room_name")
     target_role = data.get("target_role", "Product Manager")
     job_description = data.get("job_description")

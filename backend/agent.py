@@ -2,7 +2,11 @@ import os
 import json
 import logging
 import asyncio
+import io
+import wave
+import struct
 import numpy as np
+import aiohttp
 from typing import Optional
 from livekit import api, rtc
 from livekit.agents import stt, tts, llm
@@ -14,17 +18,14 @@ from livekit.plugins import openai, silero
 logger = logging.getLogger("voice-agent")
 
 
-# --- Custom Whisper V3 Turbo STT Wrapper (Runs locally on GPU) ---
-class FasterWhisperSTT(stt.STT):
-    def __init__(self, model_size_or_path: str = "turbo"):
+# --- Groq Whisper STT (Cloud API — fast, free) ---
+class GroqWhisperSTT(stt.STT):
+    def __init__(self):
         super().__init__(
             capabilities=stt.STTCapabilities(streaming=False, interim_results=False)
         )
-        from faster_whisper import WhisperModel
-        # Run STT on CPU with int8 — avoids CUDA library dependency issues.
-        # The VAD (Silero/ONNX) and TTS (Kokoro/ONNX) still use the GPU.
-        # Whisper 'turbo' on CPU is fast enough for non-streaming batch transcription.
-        self.model = WhisperModel(model_size_or_path, device="cpu", compute_type="int8")
+        self._api_key = os.environ.get("LLM_API_KEY", "")  # Reuses the same Groq key
+        self._url = "https://api.groq.com/openai/v1/audio/transcriptions"
 
     async def _recognize_impl(
         self,
@@ -32,69 +33,97 @@ class FasterWhisperSTT(stt.STT):
         *,
         language: str | None = None,
     ) -> stt.SpeechEvent:
-        # Merge audio frames into a single contiguous frame
         merged = merge_frames(buffer)
         audio_bytes = merged.data.tobytes()
-        
-        # Convert PCM 16-bit to float32
-        audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-        
-        # Transcribe audio
-        loop = asyncio.get_running_loop()
-        def transcribe():
-            segments, info = self.model.transcribe(audio_np, beam_size=1, language="en")
-            text = " ".join([segment.text for segment in segments]).strip()
-            return text, info.language
 
-        text, lang = await loop.run_in_executor(None, transcribe)
-        
+        # Convert to WAV in memory (Groq expects a file upload)
+        wav_buffer = io.BytesIO()
+        with wave.open(wav_buffer, "wb") as wf:
+            wf.setnchannels(merged.num_channels)
+            wf.setsampwidth(2)  # 16-bit
+            wf.setframerate(merged.sample_rate)
+            wf.writeframes(audio_bytes)
+        wav_buffer.seek(0)
+
+        # Call Groq Whisper API
+        form = aiohttp.FormData()
+        form.add_field("file", wav_buffer, filename="audio.wav", content_type="audio/wav")
+        form.add_field("model", "whisper-large-v3")
+        form.add_field("language", "en")
+        form.add_field("response_format", "json")
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                self._url,
+                data=form,
+                headers={"Authorization": f"Bearer {self._api_key}"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    logger.error(f"Groq STT error {resp.status}: {error_text}")
+                    return stt.SpeechEvent(
+                        type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                        alternatives=[stt.SpeechData(text="", language="en")]
+                    )
+                result = await resp.json()
+
+        text = result.get("text", "").strip()
         return stt.SpeechEvent(
             type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-            alternatives=[stt.SpeechData(text=text, language=lang or "en")]
+            alternatives=[stt.SpeechData(text=text, language="en")]
         )
 
 
-# --- Custom Kokoro-82M TTS Wrapper (Runs locally on GPU) ---
-class KokoroTTS(tts.TTS):
-    def __init__(self, model_path: str, voices_path: str, voice: str = "af_bella", speed: float = 1.0):
+# --- Deepgram Aura TTS (Cloud API — streaming, low latency) ---
+class DeepgramTTS(tts.TTS):
+    def __init__(self, voice: str = "aura-asteria-en"):
         super().__init__(
             capabilities=tts.TTSCapabilities(streaming=False),
             sample_rate=24000,
             num_channels=1,
         )
-        from kokoro_onnx import Kokoro
-        self.kokoro = Kokoro(model_path, voices_path)
-        self.voice = voice
-        self.speed = speed
+        self._api_key = os.environ.get("DEEPGRAM_API_KEY", "")
+        self._voice = voice
+        self._url = f"https://api.deepgram.com/v1/speak?model={voice}&encoding=linear16&sample_rate=24000"
 
     def synthesize(self, text: str) -> tts.ChunkedStream:
-        return KokoroChunkedStream(
-            kokoro=self.kokoro,
+        return DeepgramChunkedStream(
+            api_key=self._api_key,
+            url=self._url,
             text=text,
-            voice=self.voice,
-            speed=self.speed,
             tts_instance=self,
         )
 
 
-class KokoroChunkedStream(tts.ChunkedStream):
-    def __init__(self, kokoro, text: str, voice: str, speed: float, tts_instance: tts.TTS):
+class DeepgramChunkedStream(tts.ChunkedStream):
+    def __init__(self, api_key: str, url: str, text: str, tts_instance: tts.TTS):
         super().__init__(tts_instance, text)
-        self.kokoro = kokoro
-        self.voice = voice
-        self.speed = speed
+        self._api_key = api_key
+        self._url = url
 
     async def _main_task(self) -> None:
-        loop = asyncio.get_running_loop()
-        def generate():
-            return self.kokoro.create(self._input_text, voice=self.voice, speed=self.speed)
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                self._url,
+                json={"text": self._input_text},
+                headers={
+                    "Authorization": f"Token {self._api_key}",
+                    "Content-Type": "application/json",
+                },
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    logger.error(f"Deepgram TTS error {resp.status}: {error_text}")
+                    return
 
-        samples, sample_rate = await loop.run_in_executor(None, generate)
+                # Read the full PCM response (linear16, 24kHz, mono)
+                pcm_data = await resp.read()
 
-        # Convert float32 samples to 16-bit PCM
-        pcm_data = (samples * 32767).astype(np.int16).tobytes()
+        if not pcm_data:
+            return
 
-        # Kokoro outputs at 24000Hz — LiveKit supports 24kHz natively
         num_samples = len(pcm_data) // 2
         frame = AudioFrame(
             data=pcm_data,
@@ -105,7 +134,7 @@ class KokoroChunkedStream(tts.ChunkedStream):
 
         self._event_ch.send_nowait(
             tts.SynthesizedAudio(
-                request_id="kokoro-req",
+                request_id="deepgram-req",
                 frame=frame,
                 is_final=True,
             )
@@ -133,41 +162,48 @@ INTERVIEW_DURATION_SECONDS = 5 * 60  # 5-minute interview limit
 def get_system_prompt(target_role: str, job_description: Optional[str] = None) -> str:
     prompt = f"""You are an AI interviewer conducting a practice behavioral interview for the role of: {target_role}.
 
-This is a PRACTICE interview — your goal is to help the candidate rehearse and improve their behavioral interview skills. Be encouraging but honest. If their answer is vague, help them structure it better.
+This is a PRACTICE interview — your goal is to help the candidate rehearse and improve their behavioral interview skills. Be encouraging but honest. If their answer is vague or incomplete, probe gently.
 
 SESSION FORMAT:
 - Total time: 5 minutes
-- Structure: 2 behavioral questions, each with up to 1 follow-up probe
-- Pacing: ~2 minutes per question (including their answer and your follow-up), then ~1 minute for closing
+- You control the pacing. Aim to cover 2-3 questions depending on how detailed the candidate's answers are.
+- Short, surface-level answers → ask follow-ups to draw out depth, and you'll have time for more questions.
+- Long, detailed answers → fewer follow-ups needed, move to the next question sooner.
+- Always leave ~30 seconds at the end for a brief closing.
 
-YOUR CONVERSATION FLOW:
-1. Open with a brief, warm welcome (1 sentence). Immediately ask Question 1.
-2. Listen to their answer. If they gave a complete STAR response (Situation, Task, Action, Result), acknowledge it and move to Question 2. If they missed an element, ask ONE short follow-up to draw it out (e.g. "What was the specific outcome?" or "Can you walk me through exactly what you did?").
-3. After Question 1 is complete, transition naturally to Question 2 with a phrase like "Great, let's move to the next one."
-4. Repeat the same pattern for Question 2.
-5. After both questions, deliver a brief closing: thank them, mention one thing they did well, and wish them luck.
+YOUR CONVERSATION APPROACH:
+1. Open with a brief welcome (1 sentence), then ask your first question.
+2. After each answer, decide:
+   - If the answer covered Situation, Task, Action, AND Result clearly → acknowledge and move to the next question.
+   - If one or more STAR elements are missing or vague → ask ONE targeted follow-up (e.g. "What specifically did you do?" or "What was the measurable outcome?").
+   - If the candidate is struggling or giving very short answers → rephrase or offer a gentle nudge like "Take your time — can you think of a specific example?"
+3. Transition between questions naturally: "That's helpful, thank you. Let me ask you about something different..."
+4. When closing, briefly thank them and mention one specific thing they did well.
 
-TIME MANAGEMENT:
-- You will receive time warnings injected as system messages.
-- If you receive a [TIME WARNING], immediately wrap up whatever thread you're on. Do not start a new question. Move directly to your closing remarks.
-- If you receive [TIME UP], deliver a 1-sentence goodbye immediately. Do not continue the interview.
-- If a candidate gives a very long answer (more than ~45 seconds), do not ask a follow-up — just acknowledge and move on to save time.
+TIME AWARENESS:
+- You will receive system messages about time:
+  - [TIME CHECK: X minutes remaining] — adjust your pacing. If 2+ minutes remain and you've only asked one question, move to the next. If under 1 minute remains, begin closing.
+  - [TIME WARNING] — stop asking new questions. Wrap up naturally within 1-2 sentences.
+  - [TIME UP] — deliver a single goodbye sentence immediately.
+- Do NOT mention the time to the candidate. Just silently adjust your pacing.
+- Never rush the candidate. If time is short, it's better to have one deep conversation than two shallow ones.
 
 SPEAKING STYLE:
-- Keep every response to 1-3 short sentences. This is a voice conversation, not a written interview.
-- Sound natural and conversational. Use filler phrases like "That's great" or "I see" sparingly but naturally.
+- Keep every response to 1-3 short sentences. This is voice, not text.
+- Sound natural and conversational. Brief acknowledgments like "I see" or "Got it" are fine.
 - Never use bullet points, numbered lists, markdown, or any written formatting.
-- Never reveal you are an AI. Respond as a human interviewer would.
-- Do not repeat or summarize what the candidate just said back to them — that wastes time. Instead, acknowledge briefly and move forward.
+- Never reveal you are an AI.
+- Do not repeat or summarize what the candidate said — acknowledge briefly and move forward.
 
 QUESTION SELECTION:
-- Choose questions that assess behavioral qualities relevant to the {target_role} role: leadership, problem-solving, communication, teamwork, conflict resolution, or adaptability.
-- Frame questions using the STAR method implicitly (ask about a specific time/situation).
-- Vary the topics — don't ask two questions about the same competency.
+- Choose questions relevant to the {target_role} role: leadership, problem-solving, communication, teamwork, conflict resolution, adaptability, or decision-making under uncertainty.
+- Frame questions around specific past experiences (STAR method).
+- Vary topics — don't ask two questions about the same competency.
+- Adapt difficulty to the candidate. If their first answer is very junior, ask proportionally scoped questions.
 """
     if job_description:
         prompt += f"""
-JOB CONTEXT (use this to tailor your questions to what matters for this specific role):
+JOB CONTEXT (use this to tailor your questions):
 {job_description}
 """
     return prompt
@@ -206,16 +242,12 @@ async def start_agent_session(room_name: str, token: str, target_role: str, job_
     await room.connect(livekit_url, token)
     logger.info(f"Connected to room: {room_name}")
 
-    # Instantiate local GPU and API models
-    stt_model = FasterWhisperSTT("small")   # 'small' is 4x faster than 'turbo' on CPU with acceptable accuracy
-    tts_model = KokoroTTS(
-        model_path="/root/models/kokoro-v0_19.onnx",
-        voices_path="/root/models/voices.json",
-        speed=1.3,   # Faster speech synthesis — reduces TTS generation time
-    )
+    # Instantiate cloud API models (no local GPU needed)
+    stt_model = GroqWhisperSTT()
+    tts_model = DeepgramTTS(voice="aura-asteria-en")  # Professional female voice
     llm_model = create_llm()
     vad_model = silero.VAD.load(
-        min_silence_duration=0.8,   # Wait 800ms of silence before deciding user is done (prevents cutting off mid-thought)
+        min_silence_duration=0.8,   # Wait 800ms of silence before deciding user is done
         min_speech_duration=0.1,
     )
 
@@ -226,24 +258,49 @@ async def start_agent_session(room_name: str, token: str, target_role: str, job_
         text=get_system_prompt(target_role, job_description)
     )
 
-    # Initialize VoicePipeline
+    # Initialize VoicePipeline with early text broadcasting
+    from livekit.agents.pipeline import AgentTranscriptionOptions
+
+    # Track what we've already broadcast to avoid duplicates
+    last_candidate_broadcast = ""
+
+    def before_tts(agent, text_or_stream):
+        """Broadcast interviewer text as soon as LLM finishes streaming (before TTS audio)."""
+        if isinstance(text_or_stream, str):
+            asyncio.ensure_future(
+                broadcast_transcript(room, "interviewer", text_or_stream, is_final=True)
+            )
+            return text_or_stream
+        else:
+            async def stream_and_broadcast(stream):
+                collected = ""
+                async for chunk in stream:
+                    collected += chunk
+                    yield chunk
+                if collected.strip():
+                    await broadcast_transcript(room, "interviewer", collected.strip(), is_final=True)
+            return stream_and_broadcast(text_or_stream)
+
     pipeline = VoicePipelineAgent(
         vad=vad_model,
         stt=stt_model,
         llm=llm_model,
         tts=tts_model,
         chat_ctx=chat_ctx,
-        min_endpointing_delay=0.6,   # Wait 600ms after VAD end-of-speech before triggering LLM (gives breathing room)
+        min_endpointing_delay=0.6,
+        before_tts_cb=before_tts,
     )
 
-    # Wire up speech committed events — register BEFORE pipeline.start()
+    # Broadcast candidate text immediately when STT produces it (not waiting for agent to speak)
     @pipeline.on("user_speech_committed")
     def on_user_speech(msg: llm.ChatMessage):
+        nonlocal last_candidate_broadcast
         content = msg.content if isinstance(msg.content, str) else (
             " ".join(p.text for p in msg.content if hasattr(p, "text"))
             if msg.content else ""
         )
-        if content:
+        if content and content != last_candidate_broadcast:
+            last_candidate_broadcast = content
             logger.info(f"Candidate said: {content}")
             asyncio.ensure_future(broadcast_transcript(room, "candidate", content, is_final=True))
 
@@ -255,7 +312,6 @@ async def start_agent_session(room_name: str, token: str, target_role: str, job_
         )
         if content:
             logger.info(f"AI Interviewer said: {content}")
-            asyncio.ensure_future(broadcast_transcript(room, "interviewer", content, is_final=True))
 
     pipeline.start(room)
     logger.info("LiveKit VoicePipeline is running")
@@ -270,6 +326,7 @@ async def start_agent_session(room_name: str, token: str, target_role: str, job_
     session_start = asyncio.get_running_loop().time()
     warning_sent  = False
     interview_ended = False
+    last_time_check = 0  # Track when we last injected a time check
 
     async def send_timer_event(event_type: str):
         """Broadcast a timer control event over the data channel to the frontend."""
@@ -278,13 +335,6 @@ async def start_agent_session(room_name: str, token: str, target_role: str, job_
             await room.local_participant.publish_data(payload)
         except Exception as e:
             logger.error(f"Failed to send timer event: {e}")
-
-    async def inject_time_warning():
-        """Inject a system message into the chat context so the LLM knows time is almost up."""
-        chat_ctx.append(
-            role="system",
-            text="[TIME WARNING] You have approximately 1 minute remaining. Wrap up your current thread and begin your closing remarks within the next exchange.",
-        )
 
     try:
         while True:
@@ -302,22 +352,35 @@ async def start_agent_session(room_name: str, token: str, target_role: str, job_
                 logger.info("Room is empty. Shutting down.")
                 break
 
-            # 1-minute warning at 4:00 elapsed
+            # Inject periodic time checks every 60 seconds so the LLM can pace itself
+            elapsed_minutes = int(elapsed // 60)
+            if elapsed_minutes > last_time_check and remaining > 60:
+                last_time_check = elapsed_minutes
+                remaining_mins = int(remaining // 60)
+                chat_ctx.append(
+                    role="system",
+                    text=f"[TIME CHECK: {remaining_mins} minutes remaining]",
+                )
+                logger.info(f"Injected time check: {remaining_mins} min remaining")
+
+            # 1-minute warning
             if not warning_sent and elapsed >= (INTERVIEW_DURATION_SECONDS - 60):
-                logger.info("Sending 1-minute time warning to agent and frontend.")
+                logger.info("Sending 1-minute time warning.")
                 warning_sent = True
                 await send_timer_event("warning")
-                await inject_time_warning()
+                chat_ctx.append(
+                    role="system",
+                    text="[TIME WARNING] Less than 1 minute remaining. Begin your closing remarks naturally on your next response. Do not ask any new questions.",
+                )
 
             # Hard cutoff at 5:00 elapsed
             if not interview_ended and remaining <= 0:
                 logger.info("Time limit reached. Closing interview.")
                 interview_ended = True
                 await send_timer_event("expired")
-                # Inject a hard stop instruction so the LLM delivers a closing line
                 chat_ctx.append(
                     role="system",
-                    text="[TIME UP] The 5-minute interview is now over. Deliver a warm, natural 1-2 sentence closing right now. Do not ask any more questions.",
+                    text="[TIME UP] The interview is over. Deliver a warm 1-sentence goodbye immediately.",
                 )
                 break
 
